@@ -20,6 +20,7 @@
 const char* WIFI_SSID     = "Your_WIFI_SSID";
 const char* WIFI_PASSWORD = "Your_WIFI_Password";
 
+
 const char* NTP_SERVER      = "pool.ntp.org";
 const long  GMT_OFFSET_SEC  = 3600;  // Timezone offset (seconds)
 const int   DST_OFFSET_SEC  = 3600;  // Daylight saving (seconds)
@@ -66,17 +67,39 @@ void syncTime() {
     if (WiFi.status() == WL_CONNECTED) {
         configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
         struct tm timeinfo;
-        getLocalTime(&timeinfo);
-        Serial.println(" Time synced.");
+        if (getLocalTime(&timeinfo)) {
+            Serial.println(" Time synced.");
+        }
     }
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
 }
 
-bool isNightTime() {
+void goToDeepSleep(int currentHour) {
+    int hoursToWait;
+    if (currentHour >= NIGHT_START_H) {
+        hoursToWait = (24 - currentHour) + NIGHT_END_H;
+    } else {
+        hoursToWait = NIGHT_END_H - currentHour;
+    }
+    
+    uint64_t sleepTimeUs = (uint64_t)hoursToWait * 3600 * 1000000;
+    Serial.print("Night mode. Sleeping for "); Serial.print(hoursToWait); Serial.println(" hours.");
+    
+    Serial.flush();
+    esp_sleep_enable_timer_wakeup(sleepTimeUs);
+    esp_deep_sleep_start();
+}
+
+bool checkNightAndSleep() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) return false;
-    return (timeinfo.tm_hour >= NIGHT_START_H || timeinfo.tm_hour < NIGHT_END_H);
+    
+    if (timeinfo.tm_hour >= NIGHT_START_H || timeinfo.tm_hour < NIGHT_END_H) {
+        goToDeepSleep(timeinfo.tm_hour);
+        return true;
+    }
+    return false;
 }
 
 void logAlarm() {
@@ -103,7 +126,10 @@ void dumpLog() {
 void setup() {
     Serial.begin(115200);
     LittleFS.begin(true);
+    
     syncTime();
+    
+    if (checkNightAndSleep()) return;
 
     RadarSerial.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
     pinMode(PIEZO_PIN, OUTPUT);
@@ -124,7 +150,10 @@ void setup() {
 }
 
 void loop() {
-    radar.read();
+    if (systemActive) {
+        radar.read();
+    }
+    
     uint32_t now = millis();
 
     if (Serial.available() > 0) {
@@ -142,6 +171,8 @@ void loop() {
             deactivateClickCount = 0;
             tone(PIEZO_PIN, 2000, 100);
             systemActivationTime = now;
+            radar.requestStartEngineeringMode();
+            radar.requestEndEngineeringMode();
             Serial.println("System ON");
         } 
         else {
@@ -154,6 +185,8 @@ void loop() {
                 deactivateClickCount = 0;
                 alarmTriggered = false;
                 noTone(PIEZO_PIN);
+                radar.requestStartEngineeringMode();
+                radar.requestEndEngineeringMode();
                 tone(PIEZO_PIN, 1000, 100); delay(150);
                 tone(PIEZO_PIN, 1000, 100);
                 Serial.println("System OFF");
@@ -161,7 +194,14 @@ void loop() {
         }
     }
 
-    if (!systemActive || isNightTime()) return;
+    if (!systemActive) return;
+    
+    static uint32_t lastNightCheck = 0;
+    if (now - lastNightCheck > 60000) { 
+        lastNightCheck = now;
+        if (checkNightAndSleep()) return;
+    }
+
     if (now - systemActivationTime < GRACE_PERIOD_MS) return;
 
     if (now - lastRadarCheck > RADAR_INTERVAL_MS) {
